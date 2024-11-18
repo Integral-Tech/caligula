@@ -1,14 +1,14 @@
 use std::{
     fs::File,
-    io::{BufReader, Seek},
-    path::Path,
+    io::{BufRead, BufReader, Seek},
+    path::{Path, PathBuf},
     process::exit,
 };
 
 use anyhow::Context;
 use bytesize::ByteSize;
 use indicatif::{ProgressBar, ProgressStyle};
-use inquire::{Select, Text};
+use inquire::{Confirm, Select, Text};
 
 use crate::{
     compression::{decompress, CompressionFormat},
@@ -16,11 +16,54 @@ use crate::{
     ui::cli::{BurnArgs, HashArg, HashOf},
 };
 
+/// Common filenames of hash files.
+const HASH_FILES: [(HashAlg, &str); 24] = [
+    (HashAlg::Md5, "md5sum.txt"),
+    (HashAlg::Md5, "md5sums.txt"),
+    (HashAlg::Md5, "MD5SUM"),
+    (HashAlg::Md5, "MD5SUMS"),
+    (HashAlg::Sha1, "sha1sum.txt"),
+    (HashAlg::Sha1, "sha1sums.txt"),
+    (HashAlg::Sha1, "SHA1SUM"),
+    (HashAlg::Sha1, "SHA1SUMS"),
+    (HashAlg::Sha224, "sha224sum.txt"),
+    (HashAlg::Sha224, "sha224sums.txt"),
+    (HashAlg::Sha224, "SHA224SUM"),
+    (HashAlg::Sha224, "SHA224SUMS"),
+    (HashAlg::Sha256, "sha256sum.txt"),
+    (HashAlg::Sha256, "sha256sums.txt"),
+    (HashAlg::Sha256, "SHA256SUM"),
+    (HashAlg::Sha256, "SHA256SUMS"),
+    (HashAlg::Sha384, "sha384sum.txt"),
+    (HashAlg::Sha384, "sha384sums.txt"),
+    (HashAlg::Sha384, "SHA384SUM"),
+    (HashAlg::Sha384, "SHA384SUMS"),
+    (HashAlg::Sha512, "sha512sum.txt"),
+    (HashAlg::Sha512, "sha512sums.txt"),
+    (HashAlg::Sha512, "SHA512SUM"),
+    (HashAlg::Sha512, "SHA512SUMS"),
+];
+
 #[tracing::instrument(skip_all, fields(cf))]
 pub fn ask_hash(args: &BurnArgs, cf: CompressionFormat) -> anyhow::Result<Option<FileHashInfo>> {
     let hash_params = match &args.hash {
         HashArg::Skip => None,
-        HashArg::Ask => ask_hash_loop(cf)?,
+        HashArg::Ask => {
+            match find_hash(&args.input) {
+                Some((alg, expected_hashfile, expected_hash))
+                if Confirm::new(&format!(
+                    "Detected hash file {expected_hashfile} in the directory. Do you want to use it?"
+                ))
+                .with_default(true)
+                .prompt()? =>
+                    Some(BeginHashParams {
+                        expected_hash,
+                        alg,
+                        hasher_compression: ask_hasher_compression(cf, args.hash_of)?,
+                    }),
+                _ => ask_hash_loop(cf)?
+            }
+        }
         HashArg::Hash { alg, expected_hash } => Some(BeginHashParams {
             expected_hash: expected_hash.clone(),
             alg: alg.clone(),
@@ -53,6 +96,38 @@ pub fn ask_hash(args: &BurnArgs, cf: CompressionFormat) -> anyhow::Result<Option
     }
 
     Ok(Some(hash_result))
+}
+
+fn find_hash(input: &PathBuf) -> Option<(HashAlg, &str, Vec<u8>)> {
+    for (alg, hash_file) in HASH_FILES {
+        let hash_filepath = input.parent()?.join(hash_file);
+        if let Ok(file) = File::open(&hash_filepath) {
+            if let Some(expected_hash) =
+                parse_hashfile(BufReader::new(file), input.file_name()?.to_str()?)
+            {
+                return Some((alg, hash_file, expected_hash));
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_hashfile(hash_file: impl BufRead, input_file: &str) -> Option<Vec<u8>> {
+    for line in hash_file.lines() {
+        match line.ok()?.split_once(char::is_whitespace) {
+            Some((hash, file)) if file.trim_start() == input_file => {
+                return base16::decode(hash.as_bytes()).ok()
+            }
+            None => {
+                eprintln!("Invalid hash file");
+                return None;
+            }
+            _ => continue,
+        }
+    }
+
+    None
 }
 
 #[tracing::instrument]
@@ -190,4 +265,57 @@ struct BeginHashParams {
 enum Recoverable {
     AskAgain,
     Skip,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hashfile;
+    use std::io::Cursor;
+
+    #[test]
+    fn parse_simple_hashfile() {
+        let mut cursor = Cursor::new(
+            "bceb3dded8935c1d3521c475a69ae557e082839b46d921c8b400524470b5c965  archlinux-2024.11.01-x86_64.iso"
+        );
+
+        assert_eq!(
+            parse_hashfile(&mut cursor, "archlinux-2024.11.01-x86_64.iso").unwrap(),
+            base16::decode("bceb3dded8935c1d3521c475a69ae557e082839b46d921c8b400524470b5c965")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_complicated_hashfile() {
+        let mut cursor = Cursor::new(
+        "bceb3dded8935c1d3521c475a69ae557e082839b46d921c8b400524470b5c965  archlinux-2024.11.01-x86_64.iso\n\
+        bceb3dded8935c1d3521c475a69ae557e082839b46d921c8b400524470b5c965  archlinux-x86_64.iso\n\
+        c64745475da03a31f270b92e9abfbe7b6315596c7c97b17ef9a373433562a4a4  archlinux-bootstrap-2024.11.01-x86_64.tar.zst\n\
+        c64745475da03a31f270b92e9abfbe7b6315596c7c97b17ef9a373433562a4a4  archlinux-bootstrap-x86_64.tar.zst",
+        );
+
+        for (filename, hash) in &[
+            (
+                "archlinux-2024.11.01-x86_64.iso",
+                "bceb3dded8935c1d3521c475a69ae557e082839b46d921c8b400524470b5c965",
+            ),
+            (
+                "archlinux-x86_64.iso",
+                "bceb3dded8935c1d3521c475a69ae557e082839b46d921c8b400524470b5c965",
+            ),
+            (
+                "archlinux-bootstrap-2024.11.01-x86_64.tar.zst",
+                "c64745475da03a31f270b92e9abfbe7b6315596c7c97b17ef9a373433562a4a4",
+            ),
+            (
+                "archlinux-bootstrap-x86_64.tar.zst",
+                "c64745475da03a31f270b92e9abfbe7b6315596c7c97b17ef9a373433562a4a4",
+            ),
+        ] {
+            assert_eq!(
+                parse_hashfile(&mut cursor, filename).unwrap(),
+                base16::decode(hash).unwrap()
+            );
+        }
+    }
 }
